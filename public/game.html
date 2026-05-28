@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Ember Isle — Survive the Night</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0a0a0f;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: 'Press Start 2P', monospace;
+    }
+    canvas {
+      display: block;
+      border: 2px solid #ff6600;
+      box-shadow: 0 0 40px rgba(255,100,0,0.4), 0 0 80px rgba(255,60,0,0.15);
+      image-rendering: pixelated;
+    }
+    #subtitle {
+      color: #ff6600;
+      font-size: 10px;
+      margin-top: 10px;
+      letter-spacing: 2px;
+      opacity: 0.6;
+    }
+  </style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="subtitle">WASD: MOVE &nbsp;|&nbsp; E: CHOP / FIRE &nbsp;|&nbsp; CLICK: ATTACK</div>
+<script>
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+canvas.width = 840;
+canvas.height = 520;
+
+// ── World constants ──────────────────────────────────────────
+const TILE        = 40;
+const WORLD_W     = 32;   // tiles
+const WORLD_H     = 26;
+const DAY_DUR     = 40000; // ms
+const NIGHT_DUR   = 28000;
+
+// ── Particle pool ────────────────────────────────────────────
+let particles = [];
+function spawnParticles(x, y, color, n = 6) {
+  for (let i = 0; i < n; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 40 + Math.random() * 80;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 0.6 + Math.random() * 0.4,
+      maxLife: 0.6 + Math.random() * 0.4,
+      color,
+      r: 3 + Math.random() * 4,
+    });
+  }
+}
+
+// ── State ────────────────────────────────────────────────────
+let state = "menu"; // menu | playing | dead
+let dayCount = 1;
+let isDaytime = true;
+let cycleTimer = 0;
+let spawnTimer = 0;
+
+const player = {
+  x: (WORLD_W * TILE) / 2,
+  y: (WORLD_H * TILE) / 2,
+  w: 22, h: 22,
+  speed: 190,
+  hp: 100, maxHp: 100,
+  hunger: 100, maxHunger: 100,
+  wood: 0,
+  invincible: 0,
+  attackCooldown: 0,
+  facing: 0, // radians
+};
+
+const cam = { x: 0, y: 0 };
+const keys = {};
+let mouseX = canvas.width / 2;
+let mouseY = canvas.height / 2;
+
+let items      = [];
+let enemies    = [];
+let campfires  = [];
+let trees      = [];
+let floatTexts = [];  // floating damage numbers
+
+// ── Input ────────────────────────────────────────────────────
+document.addEventListener("keydown", e => { keys[e.code] = true; e.preventDefault(); });
+document.addEventListener("keyup",   e => { keys[e.code] = false; });
+canvas.addEventListener("mousemove", e => {
+  const rect = canvas.getBoundingClientRect();
+  mouseX = e.clientX - rect.left;
+  mouseY = e.clientY - rect.top;
+});
+canvas.addEventListener("click", () => {
+  if (state === "playing") attackSwing();
+});
+
+// ── Helpers ──────────────────────────────────────────────────
+function dist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function lerpColor(c1, c2, t) {
+  const h = s => parseInt(s, 16);
+  const r = Math.round(lerp(h(c1.slice(1,3)), h(c2.slice(1,3)), t));
+  const g = Math.round(lerp(h(c1.slice(3,5)), h(c2.slice(3,5)), t));
+  const b = Math.round(lerp(h(c1.slice(5,7)), h(c2.slice(5,7)), t));
+  return `rgb(${r},${g},${b})`;
+}
+
+function floatText(x, y, text, color = "#fff") {
+  floatTexts.push({ x, y, text, color, life: 1.2, vy: -50 });
+}
+
+// ── World init ───────────────────────────────────────────────
+function initWorld() {
+  items = []; enemies = []; campfires = []; trees = []; particles = []; floatTexts = [];
+
+  // Place trees away from player start
+  for (let i = 0; i < 45; i++) {
+    const tx = TILE * 2 + Math.random() * (WORLD_W - 4) * TILE;
+    const ty = TILE * 2 + Math.random() * (WORLD_H - 4) * TILE;
+    if (Math.hypot(tx - player.x, ty - player.y) > 150) {
+      trees.push({
+        x: tx, y: ty,
+        hp: 3, maxHp: 3,
+        type: Math.random() < 0.6 ? "apple" : "pine",
+        cooldown: 0,
+        wobble: 0,
+      });
+    }
+  }
+
+  // Scatter starting food
+  for (let i = 0; i < 12; i++) {
+    dropItem(
+      TILE * 3 + Math.random() * (WORLD_W - 6) * TILE,
+      TILE * 3 + Math.random() * (WORLD_H - 6) * TILE,
+      "apple"
+    );
+  }
+}
+
+function dropItem(x, y, type) {
+  items.push({ x, y, type, bob: Math.random() * Math.PI * 2 });
+}
+
+function spawnEnemy() {
+  const side = Math.floor(Math.random() * 4);
+  let x, y;
+  switch (side) {
+    case 0: x = Math.random() * WORLD_W * TILE; y = TILE; break;
+    case 1: x = (WORLD_W - 1) * TILE; y = Math.random() * WORLD_H * TILE; break;
+    case 2: x = Math.random() * WORLD_W * TILE; y = (WORLD_H - 1) * TILE; break;
+    default: x = TILE; y = Math.random() * WORLD_H * TILE; break;
+  }
+  const isStrong = dayCount >= 4 && Math.random() < 0.3;
+  enemies.push({
+    x, y, w: isStrong ? 32 : 26, h: isStrong ? 32 : 26,
+    hp: isStrong ? 80 : 40,
+    maxHp: isStrong ? 80 : 40,
+    speed: isStrong ? 65 : 90 + Math.random() * 30,
+    damage: isStrong ? 25 : 15,
+    attackCooldown: 0,
+    type: isStrong ? "bear" : "wolf",
+    animTimer: Math.random() * Math.PI * 2,
+  });
+}
+
+// ── Attack ───────────────────────────────────────────────────
+function attackSwing() {
+  if (player.attackCooldown > 0) return;
+  player.attackCooldown = 0.45;
+
+  // World mouse position
+  const wx = mouseX + cam.x;
+  const wy = mouseY + cam.y;
+  const range = 70;
+
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    if (Math.hypot(e.x - wx, e.y - wy) < range + e.w / 2) {
+      const dmg = 20 + Math.floor(Math.random() * 10);
+      e.hp -= dmg;
+      floatText(e.x, e.y - 20, `-${dmg}`, "#ff4444");
+      spawnParticles(e.x, e.y, "#cc0000", 4);
+      if (e.hp <= 0) {
+        spawnParticles(e.x, e.y, "#888888", 10);
+        if (Math.random() < 0.6) dropItem(e.x, e.y, "meat");
+        if (Math.random() < 0.3) dropItem(e.x, e.y, "bone");
+        enemies.splice(i, 1);
+      }
+    }
+  }
+}
+
+// ── Main update ──────────────────────────────────────────────
+function update(dt) {
+  // ── Day/night cycle ──
+  cycleTimer += dt * 1000;
+  const cycleDur = isDaytime ? DAY_DUR : NIGHT_DUR;
+  if (cycleTimer >= cycleDur) {
+    cycleTimer = 0;
+    isDaytime = !isDaytime;
+    if (isDaytime) {
+      dayCount++;
+      // Respawn food each morning
+      for (let i = 0; i < 6; i++) {
+        dropItem(
+          TILE * 2 + Math.random() * (WORLD_W - 4) * TILE,
+          TILE * 2 + Math.random() * (WORLD_H - 4) * TILE,
+          "apple"
+        );
+      }
+      floatText(canvas.width / 2 + cam.x, canvas.height / 2 + cam.y - 60,
+        `DAY ${dayCount}`, "#ffdd44");
+    } else {
+      floatText(canvas.width / 2 + cam.x, canvas.height / 2 + cam.y - 60,
+        "NIGHT FALLS...", "#aabbff");
+      // Spawn wave
+      const count = 2 + Math.floor(dayCount * 1.5);
+      for (let i = 0; i < count; i++) spawnEnemy();
+    }
+  }
+
+  // Trickle spawns at night
+  if (!isDaytime) {
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) {
+      spawnTimer = Math.max(4, 12 - dayCount);
+      spawnEnemy();
+    }
+  }
+
+  // ── Player movement ──
+  let dx = 0, dy = 0;
+  if (keys["ArrowLeft"]  || keys["KeyA"]) dx -= 1;
+  if (keys["ArrowRight"] || keys["KeyD"]) dx += 1;
+  if (keys["ArrowUp"]    || keys["KeyW"]) dy -= 1;
+  if (keys["ArrowDown"]  || keys["KeyS"]) dy += 1;
+
+  if (dx && dy) { dx *= 0.707; dy *= 0.707; }
+
+  player.x = Math.max(player.w / 2 + TILE, Math.min((WORLD_W - 1) * TILE - player.w / 2, player.x + dx * player.speed * dt));
+  player.y = Math.max(player.h / 2 + TILE, Math.min((WORLD_H - 1) * TILE - player.h / 2, player.y + dy * player.speed * dt));
+
+  // Facing toward mouse
+  player.facing = Math.atan2(mouseY + cam.y - player.y, mouseX + cam.x - player.x);
+
+  // ── Cooldowns ──
+  if (player.invincible   > 0) player.invincible   -= dt;
+  if (player.attackCooldown > 0) player.attackCooldown -= dt;
+
+  // ── Hunger drain ──
+  player.hunger -= 1.5 * dt;
+  if (player.hunger <= 0) {
+    player.hunger = 0;
+    player.hp -= 4 * dt;
+    floatText(player.x + (Math.random() - 0.5) * 30, player.y - 20, "STARVING!", "#ff8800");
+  }
+
+  // ── Night cold damage ──
+  if (!isDaytime) {
+    const nearFire = campfires.some(f => dist(player, f) < f.radius);
+    if (!nearFire) {
+      const darkness = Math.min(1, cycleTimer / 6000);
+      player.hp -= 2.5 * darkness * dt;
+    }
+  }
+
+  // ── Item pickup ──
+  items = items.filter(item => {
+    item.bob += dt * 3;
+    if (dist(player, item) < 36) {
+      if (item.type === "apple") {
+        const gain = 28;
+        player.hunger = Math.min(player.maxHunger, player.hunger + gain);
+        floatText(player.x, player.y - 20, `+${gain} hunger`, "#ffaa00");
+        spawnParticles(item.x, item.y, "#ff4444", 5);
+      }
+      if (item.type === "meat") {
+        const hgain = 55, hpgain = 15;
+        player.hunger = Math.min(player.maxHunger, player.hunger + hgain);
+        player.hp     = Math.min(player.maxHp, player.hp + hpgain);
+        floatText(player.x, player.y - 20, `+${hgain} hunger +${hpgain} HP`, "#ff7744");
+        spawnParticles(item.x, item.y, "#cc4444", 6);
+      }
+      if (item.type === "wood") {
+        player.wood++;
+        floatText(player.x, player.y - 20, "+1 wood", "#c8a060");
+        spawnParticles(item.x, item.y, "#8B4513", 4);
+      }
+      if (item.type === "bone") {
+        const hpgain = 8;
+        player.hp = Math.min(player.maxHp, player.hp + hpgain);
+        floatText(player.x, player.y - 20, `+${hpgain} HP`, "#ffffff");
+      }
+      return false;
+    }
+    return true;
+  });
+
+  // ── Tree interaction (press E) ──
+  if (keys["KeyE"]) {
+    let acted = false;
+
+    // Chop nearest tree
+    trees.forEach(tree => {
+      if (dist(player, tree) < 55 && tree.cooldown <= 0 && !acted) {
+        acted = true;
+        tree.hp--;
+        tree.cooldown = 0.4;
+        tree.wobble = 0.3;
+        spawnParticles(tree.x, tree.y, tree.type === "apple" ? "#228B22" : "#5c3d11", 3);
+        if (tree.type === "apple") dropItem(tree.x + (Math.random() - 0.5) * 30, tree.y + 10, "apple");
+        else                       dropItem(tree.x + (Math.random() - 0.5) * 20, tree.y + 10, "wood");
+        if (tree.hp <= 0) {
+          dropItem(tree.x, tree.y, "wood");
+          tree.dead = true;
+        }
+      }
+    });
+    trees = trees.filter(t => !t.dead);
+
+    // Place campfire if have enough wood and no tree nearby
+    if (!acted && player.wood >= 3) {
+      // Check not overlapping existing fire
+      const tooClose = campfires.some(f => dist(player, f) < 80);
+      if (!tooClose) {
+        campfires.push({ x: player.x, y: player.y, radius: 130, flicker: 0 });
+        player.wood -= 3;
+        spawnParticles(player.x, player.y, "#ff6600", 12);
+        floatText(player.x, player.y - 30, "CAMPFIRE LIT!", "#ff9900");
+      }
+    }
+  }
+
+  // ── Tree cooldown & wobble ──
+  trees.forEach(t => {
+    if (t.cooldown > 0) t.cooldown -= dt;
+    if (t.wobble  > 0) t.wobble   -= dt * 3;
+  });
+
+  // ── Campfire flicker ──
+  campfires.forEach(f => { f.flicker = Math.sin(Date.now() / 120) * 0.15; });
+
+  // ── Enemy AI ──
+  enemies.forEach(enemy => {
+    enemy.animTimer += dt * 3;
+    // Move toward player
+    const ex = player.x - enemy.x;
+    const ey = player.y - enemy.y;
+    const len = Math.hypot(ex, ey);
+    if (len > 0) {
+      enemy.x += (ex / len) * enemy.speed * dt;
+      enemy.y += (ey / len) * enemy.speed * dt;
+    }
+
+    // Hurt player
+    if (enemy.attackCooldown > 0) enemy.attackCooldown -= dt;
+    if (dist(player, enemy) < 28 && enemy.attackCooldown <= 0 && player.invincible <= 0) {
+      player.hp -= enemy.damage;
+      player.invincible = 0.6;
+      enemy.attackCooldown = 1.2;
+      spawnParticles(player.x, player.y, "#ff2222", 6);
+      floatText(player.x, player.y - 25, `-${enemy.damage}`, "#ff2222");
+    }
+  });
+
+  // ── Particles ──
+  particles = particles.filter(p => {
+    p.x    += p.vx * dt;
+    p.y    += p.vy * dt;
+    p.vy   += 80 * dt;
+    p.life -= dt;
+    return p.life > 0;
+  });
+
+  // ── Float texts ──
+  floatTexts = floatTexts.filter(f => {
+    f.y    += f.vy * dt;
+    f.life -= dt;
+    return f.life > 0;
+  });
+
+  // ── Death check ──
+  if (player.hp <= 0) {
+    player.hp = 0;
+    state = "dead";
+  }
+
+  // ── Camera ──
+  cam.x = Math.max(0, Math.min(WORLD_W * TILE - canvas.width,  player.x - canvas.width  / 2));
+  cam.y = Math.max(0, Math.min(WORLD_H * TILE - canvas.height, player.y - canvas.height / 2));
+}
+
+// ── Render ───────────────────────────────────────────────────
+function render(dt) {
+  const nightProg = isDaytime ? 0 : Math.min(1, cycleTimer / 7000);
+  const bgColor   = lerpColor("#2a4a1e", "#05050f", nightProg);
+  ctx.fillStyle   = bgColor;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.save();
+  ctx.translate(-cam.x, -cam.y);
+
+  // ── Ground tiles ──
+  for (let ty = 0; ty < WORLD_H; ty++) {
+    for (let tx = 0; tx < WORLD_W; tx++) {
+      const isBorder = tx === 0 || ty === 0 || tx === WORLD_W - 1 || ty === WORLD_H - 1;
+      if (isBorder) {
+        ctx.fillStyle = nightProg > 0.3 ? "#111133" : "#1a3a7a";
+      } else {
+        const g = ((tx + ty) % 2 === 0) ? "#3a6b30" : "#326028";
+        ctx.fillStyle = lerpColor(g, "#121218", nightProg);
+      }
+      ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
+    }
+  }
+
+  // ── Campfires (light + visuals) ──
+  campfires.forEach(f => {
+    const r = f.radius * (1 + f.flicker * 0.1);
+    if (!isDaytime || nightProg > 0) {
+      const grad = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, r);
+      grad.addColorStop(0,   "rgba(255,140,0,0.28)");
+      grad.addColorStop(0.5, "rgba(255,80,0,0.12)");
+      grad.addColorStop(1,   "rgba(255,40,0,0)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(f.x, f.y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // Logs
+    ctx.fillStyle = "#5c2c0c";
+    ctx.fillRect(f.x - 12, f.y + 4, 10, 6);
+    ctx.fillRect(f.x + 2,  f.y + 4, 10, 6);
+    // Flames
+    for (let i = 0; i < 3; i++) {
+      const fw = 6 + i * 2;
+      const fh = 14 + Math.sin(Date.now() / 100 + i) * 4;
+      const colors = ["#ff2200", "#ff6600", "#ffcc00"];
+      ctx.fillStyle = colors[i];
+      ctx.beginPath();
+      ctx.ellipse(f.x + (i - 1) * 5, f.y - fh / 2, fw / 2, fh / 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  });
+
+  // ── Trees ──
+  trees.forEach(tree => {
+    const wobble = Math.sin(Date.now() / 200) * tree.wobble * 0.2;
+    ctx.save();
+    ctx.translate(tree.x, tree.y);
+    ctx.rotate(wobble);
+    // Trunk
+    ctx.fillStyle = lerpColor("#6b3a0c", "#222", nightProg * 0.7);
+    ctx.fillRect(-5, -5, 10, 22);
+    // Canopy
+    const leafColor = tree.type === "apple"
+      ? lerpColor("#2d8b22", "#0a1a08", nightProg * 0.8)
+      : lerpColor("#1a5c1a", "#070d07", nightProg * 0.8);
+    ctx.fillStyle = leafColor;
+    ctx.beginPath();
+    ctx.arc(0, -20, 22, 0, Math.PI * 2);
+    ctx.fill();
+    if (tree.type === "apple" && tree.hp > 0) {
+      ctx.fillStyle = lerpColor("#dd2222", "#550808", nightProg * 0.8);
+      ctx.beginPath(); ctx.arc(-8, -16, 4, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(6,  -22, 4, 0, Math.PI * 2); ctx.fill();
+    }
+    // HP chips
+    if (tree.hp < tree.maxHp) {
+      ctx.fillStyle = "#ff0000";
+      ctx.fillRect(-14, -46, 28 * (tree.hp / tree.maxHp), 4);
+      ctx.strokeStyle = "#000";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(-14, -46, 28, 4);
+    }
+    ctx.restore();
+  });
+
+  // ── Items (bobbing) ──
+  items.forEach(item => {
+    const bob = Math.sin(item.bob) * 3;
+    if (item.type === "apple") {
+      ctx.fillStyle = lerpColor("#ee3333", "#441111", nightProg * 0.6);
+      ctx.beginPath();
+      ctx.arc(item.x, item.y + bob, 8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#33aa33";
+      ctx.fillRect(item.x - 1, item.y + bob - 10, 2, 5);
+    } else if (item.type === "wood") {
+      ctx.fillStyle = lerpColor("#8B4513", "#2a1005", nightProg * 0.6);
+      ctx.save();
+      ctx.translate(item.x, item.y + bob);
+      ctx.rotate(0.4);
+      ctx.fillRect(-12, -4, 24, 8);
+      ctx.restore();
+    } else if (item.type === "meat") {
+      ctx.fillStyle = lerpColor("#cc3333", "#440a0a", nightProg * 0.6);
+      ctx.save();
+      ctx.translate(item.x, item.y + bob);
+      ctx.fillRect(-8, -6, 16, 12);
+      ctx.fillStyle = "#ffaaaa";
+      ctx.fillRect(-5, -3, 4, 3);
+      ctx.restore();
+    } else if (item.type === "bone") {
+      ctx.fillStyle = lerpColor("#ddddcc", "#555555", nightProg * 0.6);
+      ctx.save();
+      ctx.translate(item.x, item.y + bob);
+      ctx.rotate(0.5);
+      ctx.fillRect(-10, -2, 20, 4);
+      ctx.beginPath(); ctx.arc(-10, 0, 4, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(10, 0, 4, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+  });
+
+  // ── Enemies ──
+  enemies.forEach(enemy => {
+    const bounce = Math.sin(enemy.animTimer) * 2;
+    const isBear = enemy.type === "bear";
+    ctx.save();
+    ctx.translate(enemy.x, enemy.y + bounce);
+    // Body
+    ctx.fillStyle = isBear ? "#5c3a1e" : "#556677";
+    ctx.fillRect(-enemy.w / 2, -enemy.h / 2, enemy.w, enemy.h);
+    // Ears
+    ctx.fillRect(-enemy.w / 2 - 4, -enemy.h / 2 - 6, 8, 8);
+    ctx.fillRect( enemy.w / 2 - 4, -enemy.h / 2 - 6, 8, 8);
+    // Eyes (red, menacing)
+    ctx.fillStyle = "#ff0000";
+    ctx.beginPath(); ctx.arc(-6, -4, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc( 6, -4, 3, 0, Math.PI * 2); ctx.fill();
+    // Fangs
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(-5, 2, 3, 6);
+    ctx.fillRect( 2, 2, 3, 6);
+    // HP bar
+    const bw = enemy.w + 10;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(-bw / 2, -enemy.h / 2 - 12, bw, 5);
+    ctx.fillStyle = isBear ? "#cc6600" : "#cc2222";
+    ctx.fillRect(-bw / 2, -enemy.h / 2 - 12, bw * (enemy.hp / enemy.maxHp), 5);
+    ctx.restore();
+  });
+
+  // ── Player ──
+  const flash = player.invincible > 0 && Math.sin(Date.now() / 60) > 0;
+  if (!flash) {
+    ctx.save();
+    ctx.translate(player.x, player.y);
+
+    // Attack arc indicator
+    if (player.attackCooldown > 0.1) {
+      const arcAlpha = player.attackCooldown / 0.45;
+      ctx.strokeStyle = `rgba(255,200,0,${arcAlpha * 0.5})`;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(0, 0, 60, player.facing - 0.6, player.facing + 0.6);
+      ctx.stroke();
+    }
+
+    // Body
+    ctx.fillStyle = "#2255cc";
+    ctx.fillRect(-player.w / 2, -player.h / 2, player.w, player.h);
+    // Head
+    ctx.fillStyle = "#f5c89a";
+    ctx.fillRect(-8, -player.h / 2 - 10, 16, 14);
+    // Eyes
+    ctx.fillStyle = "#222";
+    ctx.fillRect(-5, -player.h / 2 - 5, 3, 3);
+    ctx.fillRect( 2, -player.h / 2 - 5, 3, 3);
+    // Weapon arm pointing at mouse
+    ctx.rotate(player.facing);
+    ctx.fillStyle = "#c8a060";
+    ctx.fillRect(12, -3, 20, 6);
+    ctx.fillStyle = "#888";
+    ctx.fillRect(28, -4, 12, 8);
+
+    ctx.restore();
+  }
+
+  // ── Particles ──
+  particles.forEach(p => {
+    const alpha = p.life / p.maxLife;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r * alpha, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+
+  // ── Night darkness overlay ──
+  if (!isDaytime && nightProg > 0) {
+    const darkness = Math.min(0.82, nightProg * 0.85);
+
+    // Full overlay
+    ctx.fillStyle = `rgba(0,0,15,${darkness})`;
+    ctx.fillRect(cam.x, cam.y, canvas.width, canvas.height);
+
+    // Player torch light (cutout)
+    const pg = ctx.createRadialGradient(player.x, player.y, 0, player.x, player.y, 110);
+    pg.addColorStop(0,   `rgba(0,0,15,0)`);
+    pg.addColorStop(0.7, `rgba(0,0,15,${darkness * 0.3})`);
+    pg.addColorStop(1,   `rgba(0,0,15,${darkness})`);
+    ctx.fillStyle = pg;
+    ctx.beginPath();
+    ctx.arc(player.x, player.y, 110, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Campfire light cutouts
+    campfires.forEach(f => {
+      const r = f.radius * (1 + f.flicker * 0.1);
+      const fg = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, r);
+      fg.addColorStop(0,   `rgba(0,0,15,0)`);
+      fg.addColorStop(0.6, `rgba(0,0,15,${darkness * 0.2})`);
+      fg.addColorStop(1,   `rgba(0,0,15,${darkness})`);
+      ctx.fillStyle = fg;
+      ctx.beginPath();
+      ctx.arc(f.x, f.y, r, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  // ── Float texts ──
+  ctx.save();
+  floatTexts.forEach(f => {
+    const alpha = Math.min(1, f.life);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = f.color;
+    ctx.font = "bold 9px 'Press Start 2P'";
+    ctx.textAlign = "center";
+    ctx.fillText(f.text, f.x, f.y);
+  });
+  ctx.globalAlpha = 1;
+  ctx.textAlign = "left";
+  ctx.restore();
+
+  ctx.restore(); // camera
+
+  // ── HUD ──
+  if (state === "playing") drawHUD();
+  if (state === "menu")    drawMenu();
+  if (state === "dead")    drawDead();
+}
+
+// ── HUD ──────────────────────────────────────────────────────
+function drawHUD() {
+  // Panel
+  ctx.fillStyle = "rgba(0,0,0,0.65)";
+  roundRect(8, 8, 220, 80, 6);
+
+  // HP
+  drawBar(18, 18, 200, 16, player.hp / player.maxHp, "#dd2222", "#550000");
+  ctx.fillStyle = "#fff"; ctx.font = "7px 'Press Start 2P'";
+  ctx.fillText(`HP  ${Math.ceil(player.hp)}/${player.maxHp}`, 22, 30);
+
+  // Hunger
+  drawBar(18, 40, 200, 16, player.hunger / player.maxHunger, "#ffaa00", "#553300");
+  ctx.fillStyle = "#fff";
+  ctx.fillText(`FOOD ${Math.ceil(player.hunger)}/${player.maxHunger}`, 22, 52);
+
+  // Wood
+  ctx.fillStyle = "#c8a060";
+  ctx.fillText(`WOOD: ${player.wood}  (need 3, press E)`, 18, 78);
+
+  // Day/night panel
+  const isDark = !isDaytime;
+  ctx.fillStyle = "rgba(0,0,0,0.65)";
+  roundRect(canvas.width - 200, 8, 192, 38, 6);
+  ctx.fillStyle = isDark ? "#aabbff" : "#ffdd44";
+  ctx.font = "9px 'Press Start 2P'";
+  ctx.textAlign = "right";
+  ctx.fillText(`${isDark ? "🌙 NIGHT" : "☀ DAY"}  #${dayCount}`, canvas.width - 14, 32);
+  ctx.textAlign = "left";
+
+  // Cycle progress bar
+  const cycleDur = isDaytime ? DAY_DUR : NIGHT_DUR;
+  const prog = cycleTimer / cycleDur;
+  ctx.fillStyle = "rgba(0,0,0,0.65)";
+  roundRect(canvas.width - 200, 52, 192, 12, 4);
+  ctx.fillStyle = isDark ? "#3344aa" : "#aa8800";
+  ctx.fillRect(canvas.width - 198, 54, 188 * prog, 8);
+  ctx.fillStyle = "#ffffff55";
+  ctx.font = "6px 'Press Start 2P'";
+  ctx.fillText(isDark ? "UNTIL DAWN" : "UNTIL NIGHT", canvas.width - 196, 61);
+
+  // Cold warning
+  if (!isDaytime) {
+    const nearFire = campfires.some(f => dist(player, f) < f.radius);
+    if (!nearFire) {
+      const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 300);
+      ctx.globalAlpha = 0.6 + pulse * 0.4;
+      ctx.fillStyle = "rgba(80,100,220,0.35)";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = "#aaccff";
+      ctx.font = "8px 'Press Start 2P'";
+      ctx.textAlign = "center";
+      ctx.fillText("❄  FREEZING — BUILD A CAMPFIRE!  ❄", canvas.width / 2, canvas.height - 16);
+      ctx.textAlign = "left";
+    }
+  }
+}
+
+function drawBar(x, y, w, h, frac, fillColor, bgColor) {
+  ctx.fillStyle = bgColor;
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = fillColor;
+  ctx.fillRect(x, y, w * Math.max(0, frac), h);
+  ctx.strokeStyle = "#ffffff22";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x, y, w, h);
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h);
+  ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// ── Menu ─────────────────────────────────────────────────────
+function drawMenu() {
+  ctx.fillStyle = "rgba(0,0,0,0.78)";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Title
+  ctx.fillStyle = "#ff6600";
+  ctx.font = "28px 'Press Start 2P'";
+  ctx.textAlign = "center";
+  ctx.shadowColor = "#ff4400";
+  ctx.shadowBlur = 20;
+  ctx.fillText("EMBER ISLE", canvas.width / 2, canvas.height / 2 - 120);
+  ctx.shadowBlur = 0;
+
+  ctx.fillStyle = "#ffcc44";
+  ctx.font = "9px 'Press Start 2P'";
+  ctx.fillText("SURVIVE THE NIGHT", canvas.width / 2, canvas.height / 2 - 80);
+
+  const tips = [
+    "🌲  Chop trees with E to get apples + wood",
+    "🔥  Collect 3 wood, press E to place campfire",
+    "🌙  Stay near fire at night or you'll freeze",
+    "🐺  Click to attack wolves — they drop meat",
+    "❤   Eat apples to fill hunger. Meat heals HP",
+  ];
+  ctx.fillStyle = "#aaaacc";
+  ctx.font = "8px 'Press Start 2P'";
+  tips.forEach((tip, i) => {
+    ctx.fillText(tip, canvas.width / 2, canvas.height / 2 - 35 + i * 22);
+  });
+
+  const pulse = 0.6 + 0.4 * Math.sin(Date.now() / 500);
+  ctx.globalAlpha = pulse;
+  ctx.fillStyle = "#44ff88";
+  ctx.font = "11px 'Press Start 2P'";
+  ctx.fillText("PRESS  SPACE  TO  START", canvas.width / 2, canvas.height / 2 + 100);
+  ctx.globalAlpha = 1;
+  ctx.textAlign = "left";
+}
+
+// ── Death screen ──────────────────────────────────────────────
+function drawDead() {
+  ctx.fillStyle = "rgba(0,0,0,0.85)";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.fillStyle = "#cc0000";
+  ctx.font = "30px 'Press Start 2P'";
+  ctx.textAlign = "center";
+  ctx.shadowColor = "#ff0000";
+  ctx.shadowBlur = 30;
+  ctx.fillText("YOU PERISHED", canvas.width / 2, canvas.height / 2 - 70);
+  ctx.shadowBlur = 0;
+
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "10px 'Press Start 2P'";
+  ctx.fillText(`YOU SURVIVED  ${dayCount}  DAY${dayCount !== 1 ? "S" : ""}`, canvas.width / 2, canvas.height / 2 - 20);
+
+  const medal = dayCount >= 10 ? "🏆 LEGEND" : dayCount >= 7 ? "🥇 SURVIVOR" : dayCount >= 4 ? "🥈 FIGHTER" : "🥉 NOVICE";
+  ctx.fillStyle = "#ffdd44";
+  ctx.font = "9px 'Press Start 2P'";
+  ctx.fillText(medal, canvas.width / 2, canvas.height / 2 + 15);
+
+  const pulse = 0.6 + 0.4 * Math.sin(Date.now() / 500);
+  ctx.globalAlpha = pulse;
+  ctx.fillStyle = "#44ff88";
+  ctx.font = "11px 'Press Start 2P'";
+  ctx.fillText("PRESS  SPACE  TO  RETRY", canvas.width / 2, canvas.height / 2 + 65);
+  ctx.globalAlpha = 1;
+  ctx.textAlign = "left";
+}
+
+// ── Start / Restart ───────────────────────────────────────────
+function startGame() {
+  player.x = (WORLD_W * TILE) / 2;
+  player.y = (WORLD_H * TILE) / 2;
+  player.hp = 100; player.hunger = 100; player.wood = 0;
+  player.invincible = 0; player.attackCooldown = 0;
+  dayCount = 1; isDaytime = true; cycleTimer = 0; spawnTimer = 12;
+  initWorld();
+  state = "playing";
+}
+
+document.addEventListener("keydown", e => {
+  if (e.code === "Space" && (state === "menu" || state === "dead")) startGame();
+});
+
+// ── Game loop ─────────────────────────────────────────────────
+let lastTime = 0;
+function loop(ts) {
+  const dt = Math.min((ts - lastTime) / 1000, 0.05);
+  lastTime = ts;
+  if (state === "playing") update(dt);
+  render(dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
