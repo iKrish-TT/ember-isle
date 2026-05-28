@@ -32,7 +32,7 @@
 </head>
 <body>
 <canvas id="game"></canvas>
-<div id="subtitle">WASD: MOVE &nbsp;|&nbsp; E: CHOP / FIRE &nbsp;|&nbsp; CLICK: ATTACK</div>
+<div id="subtitle">WASD: MOVE &nbsp;|&nbsp; CLICK: SHOOT &nbsp;|&nbsp; E: CHOP / CAMPFIRE</div>
 <script>
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
@@ -89,11 +89,12 @@ const keys = {};
 let mouseX = canvas.width / 2;
 let mouseY = canvas.height / 2;
 
-let items      = [];
-let enemies    = [];
-let campfires  = [];
-let trees      = [];
-let floatTexts = [];  // floating damage numbers
+let items       = [];
+let enemies     = [];
+let campfires   = [];
+let trees       = [];
+let floatTexts  = [];  // floating damage numbers
+let projectiles = [];  // fired bolts
 
 // ── Input ────────────────────────────────────────────────────
 document.addEventListener("keydown", e => { keys[e.code] = true; e.preventDefault(); });
@@ -128,7 +129,7 @@ function floatText(x, y, text, color = "#fff") {
 
 // ── World init ───────────────────────────────────────────────
 function initWorld() {
-  items = []; enemies = []; campfires = []; trees = []; particles = []; floatTexts = [];
+  items = []; enemies = []; campfires = []; trees = []; particles = []; floatTexts = []; projectiles = [];
 
   // Place trees away from player start
   for (let i = 0; i < 45; i++) {
@@ -181,31 +182,25 @@ function spawnEnemy() {
   });
 }
 
-// ── Attack ───────────────────────────────────────────────────
+// ── Attack — fires a projectile ──────────────────────────────
 function attackSwing() {
   if (player.attackCooldown > 0) return;
-  player.attackCooldown = 0.45;
+  player.attackCooldown = 0.38;
 
-  // World mouse position
-  const wx = mouseX + cam.x;
-  const wy = mouseY + cam.y;
-  const range = 70;
+  // Spawn bolt from weapon tip (offset in facing direction)
+  const tipDist = 36;
+  const bx = player.x + Math.cos(player.facing) * tipDist;
+  const by = player.y + Math.sin(player.facing) * tipDist;
 
-  for (let i = enemies.length - 1; i >= 0; i--) {
-    const e = enemies[i];
-    if (Math.hypot(e.x - wx, e.y - wy) < range + e.w / 2) {
-      const dmg = 20 + Math.floor(Math.random() * 10);
-      e.hp -= dmg;
-      floatText(e.x, e.y - 20, `-${dmg}`, "#ff4444");
-      spawnParticles(e.x, e.y, "#cc0000", 4);
-      if (e.hp <= 0) {
-        spawnParticles(e.x, e.y, "#888888", 10);
-        if (Math.random() < 0.6) dropItem(e.x, e.y, "meat");
-        if (Math.random() < 0.3) dropItem(e.x, e.y, "bone");
-        enemies.splice(i, 1);
-      }
-    }
-  }
+  projectiles.push({
+    x: bx, y: by,
+    vx: Math.cos(player.facing) * 520,
+    vy: Math.sin(player.facing) * 520,
+    life: 1.2,          // seconds before despawn
+    hit: false,
+    trail: [],          // last N positions for trail effect
+    dmg: 18 + Math.floor(Math.random() * 12),
+  });
 }
 
 // ── Main update ──────────────────────────────────────────────
@@ -388,6 +383,39 @@ function update(dt) {
     p.vy   += 80 * dt;
     p.life -= dt;
     return p.life > 0;
+  });
+
+  // ── Projectiles ──
+  projectiles = projectiles.filter(bolt => {
+    // Record trail
+    bolt.trail.push({ x: bolt.x, y: bolt.y });
+    if (bolt.trail.length > 8) bolt.trail.shift();
+
+    bolt.x    += bolt.vx * dt;
+    bolt.y    += bolt.vy * dt;
+    bolt.life -= dt;
+
+    // World boundary kill
+    if (bolt.x < 0 || bolt.x > WORLD_W * TILE || bolt.y < 0 || bolt.y > WORLD_H * TILE) return false;
+
+    // Hit enemies
+    for (let i = enemies.length - 1; i >= 0; i--) {
+      const e = enemies[i];
+      if (Math.hypot(bolt.x - e.x, bolt.y - e.y) < e.w / 2 + 6) {
+        e.hp -= bolt.dmg;
+        floatText(e.x, e.y - 20, `-${bolt.dmg}`, "#ffdd44");
+        spawnParticles(bolt.x, bolt.y, "#ffaa00", 6);
+        if (e.hp <= 0) {
+          spawnParticles(e.x, e.y, "#888888", 10);
+          if (Math.random() < 0.6) dropItem(e.x, e.y, "meat");
+          if (Math.random() < 0.3) dropItem(e.x, e.y, "bone");
+          enemies.splice(i, 1);
+        }
+        return false; // bolt is consumed on hit
+      }
+    }
+
+    return bolt.life > 0;
   });
 
   // ── Float texts ──
@@ -607,6 +635,41 @@ function render(dt) {
   });
   ctx.globalAlpha = 1;
 
+  // ── Projectiles ──
+  projectiles.forEach(bolt => {
+    // Glowing trail
+    bolt.trail.forEach((pt, i) => {
+      const t = i / bolt.trail.length;
+      ctx.globalAlpha = t * 0.5;
+      ctx.fillStyle = `hsl(${40 + t * 20}, 100%, 60%)`;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, 5 * t, 0, Math.PI * 2);
+      ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+
+    // Outer glow
+    const grd = ctx.createRadialGradient(bolt.x, bolt.y, 0, bolt.x, bolt.y, 14);
+    grd.addColorStop(0,   "rgba(255,220,80,0.8)");
+    grd.addColorStop(0.4, "rgba(255,120,20,0.4)");
+    grd.addColorStop(1,   "rgba(255,60,0,0)");
+    ctx.fillStyle = grd;
+    ctx.beginPath();
+    ctx.arc(bolt.x, bolt.y, 14, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Core bolt
+    ctx.save();
+    ctx.translate(bolt.x, bolt.y);
+    ctx.rotate(Math.atan2(bolt.vy, bolt.vx));
+    ctx.fillStyle = "#ffffff";
+    ctx.shadowColor = "#ffcc00";
+    ctx.shadowBlur = 10;
+    ctx.fillRect(-10, -3, 20, 6);
+    ctx.shadowBlur = 0;
+    ctx.restore();
+  });
+
   // ── Night darkness overlay ──
   if (!isDaytime && nightProg > 0) {
     const darkness = Math.min(0.82, nightProg * 0.85);
@@ -767,7 +830,7 @@ function drawMenu() {
     "🌲  Chop trees with E to get apples + wood",
     "🔥  Collect 3 wood, press E to place campfire",
     "🌙  Stay near fire at night or you'll freeze",
-    "🐺  Click to attack wolves — they drop meat",
+    "🐺  CLICK to shoot wolves — they drop meat",
     "❤   Eat apples to fill hunger. Meat heals HP",
   ];
   ctx.fillStyle = "#aaaacc";
